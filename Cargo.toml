@@ -2,5 +2,23 @@
 name = "shell-surface"
 version = "0.1.0"
 edition = "2024"
+description = "Renderer-agnostic GUI shell backends for Wayland layer-shell and X11"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["wayland", "x11"]
+wayland = [
+    "dep:memmap2",
+    "dep:tempfile",
+    "dep:wayland-client",
+    "dep:wayland-protocols-wlr",
+]
+x11 = ["dep:x11rb"]
 
 [dependencies]
+memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+x11rb = { version = "0.13", features = ["allow-unsafe-code"], optional = true }
