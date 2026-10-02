@@ -154,7 +154,7 @@ pub enum MouseButton {
 }
 
 /// A normalized input event delivered to a logical surface.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     CloseRequested,
     Resized {
@@ -162,20 +162,24 @@ pub enum InputEvent {
     },
     PointerEnter {
         position: PositionF64,
+        output: Option<String>,
     },
     PointerLeave,
     PointerMotion {
         position: PositionF64,
+        output: Option<String>,
     },
     PointerButton {
         position: PositionF64,
         button: MouseButton,
         pressed: bool,
+        output: Option<String>,
     },
     PointerScroll {
         position: PositionF64,
         delta_x: f64,
         delta_y: f64,
+        output: Option<String>,
     },
     Key {
         keycode: u32,

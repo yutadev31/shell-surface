@@ -221,6 +221,7 @@ impl State<'_> {
                             f64::from(event.event_x),
                             f64::from(event.event_y),
                         ),
+                        output: None,
                     },
                 );
             }
@@ -235,6 +236,7 @@ impl State<'_> {
                             f64::from(event.event_x),
                             f64::from(event.event_y),
                         ),
+                        output: None,
                     },
                 );
             }
@@ -247,26 +249,31 @@ impl State<'_> {
                             position,
                             delta_x: 0.0,
                             delta_y: -1.0,
+                            output: None,
                         }),
                         5 => Some(InputEvent::PointerScroll {
                             position,
                             delta_x: 0.0,
                             delta_y: 1.0,
+                            output: None,
                         }),
                         6 => Some(InputEvent::PointerScroll {
                             position,
                             delta_x: 1.0,
                             delta_y: 0.0,
+                            output: None,
                         }),
                         7 => Some(InputEvent::PointerScroll {
                             position,
                             delta_x: -1.0,
                             delta_y: 0.0,
+                            output: None,
                         }),
                         button => Some(InputEvent::PointerButton {
                             position,
                             button: mouse_button(button),
                             pressed: true,
+                            output: None,
                         }),
                     };
                     self.shell
@@ -285,6 +292,7 @@ impl State<'_> {
                         ),
                         button: mouse_button(event.detail),
                         pressed: false,
+                        output: None,
                     },
                 );
             }

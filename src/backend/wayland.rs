@@ -497,6 +497,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         surface: state.surfaces[index].logical_surface,
                         event: InputEvent::PointerEnter {
                             position: state.pointer_position,
+                            output: state.surfaces[index].monitor_name.clone(),
                         },
                     });
                 }
@@ -521,6 +522,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         surface: state.surfaces[index].logical_surface,
                         event: InputEvent::PointerMotion {
                             position: state.pointer_position,
+                            output: state.surfaces[index].monitor_name.clone(),
                         },
                     });
                 }
@@ -538,6 +540,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                             button: mouse_button(button),
                             pressed: button_state.into_result().ok()
                                 == Some(wl_pointer::ButtonState::Pressed),
+                            output: state.surfaces[index].monitor_name.clone(),
                         },
                     });
                 }
@@ -555,6 +558,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                             position: state.pointer_position,
                             delta_x,
                             delta_y,
+                            output: state.surfaces[index].monitor_name.clone(),
                         },
                     });
                 }
