@@ -21,4 +21,4 @@ memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
-x11rb = { version = "0.13", features = ["allow-unsafe-code"], optional = true }
+x11rb = { version = "0.14", features = ["allow-unsafe-code"], optional = true }
