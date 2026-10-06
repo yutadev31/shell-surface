@@ -127,8 +127,14 @@ impl Backend for X11Backend {
         }
 
         loop {
+            if state.shell.should_close() {
+                return Ok(());
+            }
             while let Some(event) = state.connection.poll_for_event()? {
                 if !state.handle_event(event)? {
+                    return Ok(());
+                }
+                if state.shell.should_close() {
                     return Ok(());
                 }
             }

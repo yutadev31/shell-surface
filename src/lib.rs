@@ -62,13 +62,15 @@ pub enum KeyboardInteractivity {
 }
 
 /// Which output a layer-shell surface is attached to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum OutputSelection {
     /// Create one surface on every advertised output.
     All,
     /// Let the compositor choose the output for one surface.
     #[default]
     Compositor,
+    /// Create one surface on the output with this wl_output name.
+    Named(String),
 }
 
 /// Edge anchors used by layer-shell. Empty anchors describe a floating surface.
@@ -157,6 +159,7 @@ pub enum MouseButton {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     CloseRequested,
+    FocusLost,
     Resized {
         size: Size,
     },
@@ -220,6 +223,11 @@ pub trait Shell {
 
     /// Return whether the application needs another frame.
     fn take_redraw_request(&mut self) -> bool {
+        false
+    }
+
+    /// Return true to close the surfaces and stop the backend event loop.
+    fn should_close(&self) -> bool {
         false
     }
 }

@@ -46,9 +46,12 @@ impl Backend for WaylandBackend {
         let layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = globals.bind(&qh, 1..=4, ())?;
         let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=9, ())?;
 
-        let needs_output_binding = configs
-            .iter()
-            .any(|config| config.output == OutputSelection::All);
+        let needs_output_binding = configs.iter().any(|config| {
+            matches!(
+                &config.output,
+                OutputSelection::All | OutputSelection::Named(_)
+            )
+        });
         let registry = globals.registry().clone();
         let outputs = if needs_output_binding {
             globals.contents().with_list(|list| {
@@ -71,24 +74,39 @@ impl Backend for WaylandBackend {
             return Err("Wayland compositor advertised no outputs".into());
         }
 
-        let mut surfaces = Vec::new();
+        let pointer = seat.get_pointer(&qh, ());
+        let keyboard = configs
+            .iter()
+            .any(|config| config.keyboard_interactivity != KeyboardInteractivity::None)
+            .then(|| seat.get_keyboard(&qh, ()));
+        let mut state = State::new(shm, outputs.clone(), Vec::new(), seat, pointer, keyboard);
+        // wl_output names are delivered asynchronously, so resolve named
+        // outputs before constructing their layer surfaces.
+        event_queue.roundtrip(&mut state)?;
+
         for (index, config) in configs.iter().enumerate() {
             let surface_id = SurfaceId(index);
-            match config.output {
+            match &config.output {
                 OutputSelection::All => {
                     for output in &outputs {
-                        surfaces.push(create_surface(
+                        let mut surface = create_surface(
                             &compositor,
                             &layer_shell,
                             Some(output),
                             surface_id,
                             config,
                             &qh,
-                        ));
+                        );
+                        surface.monitor_name = state
+                            .output_names
+                            .iter()
+                            .find(|(known, _)| known == output)
+                            .map(|(_, name)| name.clone());
+                        state.surfaces.push(surface);
                     }
                 }
                 OutputSelection::Compositor => {
-                    surfaces.push(create_surface(
+                    state.surfaces.push(create_surface(
                         &compositor,
                         &layer_shell,
                         None,
@@ -97,19 +115,30 @@ impl Backend for WaylandBackend {
                         &qh,
                     ));
                 }
+                OutputSelection::Named(name) => {
+                    let output = state
+                        .output_names
+                        .iter()
+                        .find(|(_, known_name)| known_name == name)
+                        .map(|(output, _)| output.clone())
+                        .ok_or_else(|| format!("Wayland output `{name}` is unavailable"))?;
+                    let mut surface = create_surface(
+                        &compositor,
+                        &layer_shell,
+                        Some(&output),
+                        surface_id,
+                        config,
+                        &qh,
+                    );
+                    surface.monitor_name = Some(name.clone());
+                    state.surfaces.push(surface);
+                }
             }
         }
-
-        let pointer = seat.get_pointer(&qh, ());
-        let keyboard = configs
-            .iter()
-            .any(|config| config.keyboard_interactivity != KeyboardInteractivity::None)
-            .then(|| seat.get_keyboard(&qh, ()));
-        let mut state = State::new(shm, outputs, surfaces, seat, pointer, keyboard);
         event_queue.roundtrip(&mut state)?;
         state.draw_pending(&qh, shell)?;
 
-        while !state.closed {
+        while !state.closed && !shell.should_close() {
             event_queue.blocking_dispatch(&mut state)?;
             if shell.take_redraw_request() {
                 state.mark_all_for_redraw();
@@ -120,6 +149,9 @@ impl Backend for WaylandBackend {
             }
             for pending in pointer_events {
                 shell.handle_event(pending.surface, pending.event);
+            }
+            if shell.should_close() {
+                break;
             }
             state.draw_pending(&qh, shell)?;
         }
@@ -152,7 +184,19 @@ fn create_surface(
     layer_surface.set_exclusive_zone(config.exclusive_zone);
     layer_surface.set_keyboard_interactivity(keyboard_interactivity(config.keyboard_interactivity));
     if config.position != super::Position::default() {
-        layer_surface.set_margin(config.position.y, 0, config.position.x, 0);
+        let left =
+            if config.anchors.contains(Anchors::LEFT) && !config.anchors.contains(Anchors::RIGHT) {
+                config.position.x
+            } else {
+                0
+            };
+        let right =
+            if config.anchors.contains(Anchors::RIGHT) && !config.anchors.contains(Anchors::LEFT) {
+                config.position.x
+            } else {
+                0
+            };
+        layer_surface.set_margin(config.position.y, right, 0, left);
     }
     surface.commit();
     SurfaceState::new(
@@ -203,6 +247,7 @@ fn keyboard_interactivity(
 struct State {
     shm: wl_shm::WlShm,
     _outputs: Vec<wl_output::WlOutput>,
+    output_names: Vec<(wl_output::WlOutput, String)>,
     surfaces: Vec<SurfaceState>,
     _seat: wl_seat::WlSeat,
     _pointer: wl_pointer::WlPointer,
@@ -268,6 +313,7 @@ impl State {
         Self {
             shm,
             _outputs: outputs,
+            output_names: Vec::new(),
             surfaces,
             _seat: seat,
             _pointer: pointer,
@@ -581,7 +627,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_surface = state.surface_index(&surface);
             }
-            wl_keyboard::Event::Leave { .. } => state.keyboard_surface = None,
+            wl_keyboard::Event::Leave { surface, .. } => {
+                if let Some(index) = state.surface_index(&surface) {
+                    state.pending_events.push(PendingEvent {
+                        surface: state.surfaces[index].logical_surface,
+                        event: InputEvent::FocusLost,
+                    });
+                }
+                state.keyboard_surface = None;
+            }
             wl_keyboard::Event::Key {
                 key,
                 state: key_state,
@@ -633,14 +687,24 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         _conn: &wayland_client::Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(surface) = state
+        if let wl_output::Event::Name { name } = event {
+            if let Some((_, known_name)) = state
+                .output_names
+                .iter_mut()
+                .find(|(known, _)| known == proxy)
+            {
+                *known_name = name.clone();
+            } else {
+                state.output_names.push((proxy.clone(), name.clone()));
+            }
+            for surface in state
                 .surfaces
                 .iter_mut()
-                .find(|surface| surface.output.as_ref() == Some(proxy))
-        {
-            surface.monitor_name = Some(name);
-            surface.needs_redraw = true;
+                .filter(|surface| surface.output.as_ref() == Some(proxy))
+            {
+                surface.monitor_name = Some(name.clone());
+                surface.needs_redraw = true;
+            }
         }
     }
 }
