@@ -67,7 +67,7 @@ impl Backend for X11Backend {
                 PropMode::REPLACE,
                 window,
                 atoms.net_wm_name,
-                AtomEnum::STRING,
+                atoms.utf8_string,
                 config.namespace.as_bytes(),
             )?;
             connection.change_property32(
@@ -420,15 +420,16 @@ fn set_strut(
 
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
-        net_wm_window_type,
-        net_wm_window_type_dock,
-        net_wm_window_type_normal,
-        net_wm_state,
-        net_wm_state_above,
-        net_wm_strut,
-        net_wm_strut_partial,
-        net_wm_name,
-        wm_protocols,
-        wm_delete_window,
+        net_wm_window_type: b"_NET_WM_WINDOW_TYPE".as_slice(),
+        net_wm_window_type_dock: b"_NET_WM_WINDOW_TYPE_DOCK".as_slice(),
+        net_wm_window_type_normal: b"_NET_WM_WINDOW_TYPE_NORMAL".as_slice(),
+        net_wm_state: b"_NET_WM_STATE".as_slice(),
+        net_wm_state_above: b"_NET_WM_STATE_ABOVE".as_slice(),
+        net_wm_strut: b"_NET_WM_STRUT".as_slice(),
+        net_wm_strut_partial: b"_NET_WM_STRUT_PARTIAL".as_slice(),
+        net_wm_name: b"_NET_WM_NAME".as_slice(),
+        utf8_string: b"UTF8_STRING".as_slice(),
+        wm_protocols: b"WM_PROTOCOLS".as_slice(),
+        wm_delete_window: b"WM_DELETE_WINDOW".as_slice(),
     }
 }
