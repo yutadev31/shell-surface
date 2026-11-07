@@ -1,0 +1,566 @@
+use std::{error::Error, thread, time::Duration};
+
+use x11rb::{
+    CURRENT_TIME,
+    connection::Connection,
+    protocol::xproto::{
+        AtomEnum, ClientMessageEvent, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask,
+        ImageFormat, InputFocus, KeyButMask, PropMode, WindowClass,
+    },
+    rust_connection::RustConnection,
+    wrapper::ConnectionExt as WrapperConnectionExt,
+};
+
+use super::{
+    Backend, InputEvent, Key, KeyboardInteractivity, Layer, MouseButton, PositionF64, Shell, Size,
+    SurfaceConfig, SurfaceId,
+};
+
+/// X11 backend for ordinary GUI windows and dock/panel-style surfaces.
+#[derive(Default)]
+pub struct X11Backend;
+
+impl Backend for X11Backend {
+    fn run(&mut self, shell: &mut dyn Shell) -> Result<(), crate::Error> {
+        run(shell).map_err(|source| crate::Error::Backend {
+            backend: "X11",
+            source,
+        })
+    }
+}
+
+fn run(shell: &mut dyn Shell) -> Result<(), Box<dyn Error>> {
+    let configs = shell.surface_configs().to_vec();
+
+    if configs.is_empty() {
+        return Err("shell has no surfaces".into());
+    }
+
+    let (connection, screen_number) = RustConnection::connect(None)?;
+    let screen = &connection.setup().roots[screen_number];
+    let atoms = Atoms::new(&connection)?.reply()?;
+    let min_keycode = connection.setup().min_keycode;
+    let keyboard_mapping = keyboard_mapping(&connection)?;
+    let mut windows = Vec::with_capacity(configs.len());
+
+    for (index, config) in configs.iter().enumerate() {
+        let window = connection.generate_id()?;
+        let width = config.size.width.max(1);
+        let height = config.size.height.max(1);
+        let event_mask = EventMask::EXPOSURE
+            | EventMask::STRUCTURE_NOTIFY
+            | EventMask::POINTER_MOTION
+            | EventMask::ENTER_WINDOW
+            | EventMask::LEAVE_WINDOW
+            | EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE
+            | EventMask::KEY_PRESS
+            | EventMask::KEY_RELEASE;
+        let event_mask = event_mask | EventMask::FOCUS_CHANGE;
+
+        connection.create_window(
+            0,
+            window,
+            screen.root,
+            i16::try_from(config.position.x)?,
+            i16::try_from(config.position.y)?,
+            u16::try_from(width)?,
+            u16::try_from(height)?,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new()
+                .background_pixel(screen.black_pixel)
+                .override_redirect(u32::from(config.override_redirect))
+                .event_mask(event_mask),
+        )?;
+
+        connection.change_property8(
+            PropMode::REPLACE,
+            window,
+            atoms.net_wm_name,
+            atoms.utf8_string,
+            config.namespace.as_bytes(),
+        )?;
+        connection.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.wm_protocols,
+            AtomEnum::ATOM,
+            &[atoms.wm_delete_window],
+        )?;
+
+        let is_panel = !config.anchors.is_empty() || config.exclusive_zone > 0;
+
+        let window_type = if is_panel {
+            atoms.net_wm_window_type_dock
+        } else {
+            atoms.net_wm_window_type_normal
+        };
+
+        connection.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.net_wm_window_type,
+            AtomEnum::ATOM,
+            &[window_type],
+        )?;
+
+        if matches!(config.layer, Layer::Top | Layer::Overlay) {
+            connection.change_property32(
+                PropMode::REPLACE,
+                window,
+                atoms.net_wm_state,
+                AtomEnum::ATOM,
+                &[atoms.net_wm_state_above],
+            )?;
+        }
+
+        set_strut(&connection, window, atoms, screen, config)?;
+        connection.map_window(window)?;
+
+        if config.keyboard_interactivity != KeyboardInteractivity::None {
+            connection.set_input_focus(InputFocus::POINTER_ROOT, window, CURRENT_TIME)?;
+        }
+
+        let gc = connection.generate_id()?;
+
+        connection.create_gc(gc, window, &CreateGCAux::new())?;
+        windows.push(WindowState {
+            surface: SurfaceId(index),
+            window,
+            gc,
+            size: Size::new(width, height),
+        });
+    }
+
+    connection.flush()?;
+
+    let mut state = State {
+        connection,
+        atoms,
+        windows,
+        shell,
+        min_keycode,
+        keyboard_mapping,
+    };
+    state.run_event_loop()
+}
+
+struct WindowState {
+    surface: SurfaceId,
+    window: u32,
+    gc: u32,
+    size: Size,
+}
+
+struct State<'a> {
+    connection: RustConnection,
+    atoms: Atoms,
+    windows: Vec<WindowState>,
+    shell: &'a mut dyn Shell,
+    min_keycode: u8,
+    keyboard_mapping: x11rb::protocol::xproto::GetKeyboardMappingReply,
+}
+
+impl State<'_> {
+    fn run_event_loop(&mut self) -> Result<(), Box<dyn Error>> {
+        for index in 0..self.windows.len() {
+            self.redraw(index)?;
+        }
+
+        loop {
+            if self.shell.should_close() {
+                return Ok(());
+            }
+
+            while let Some(event) = self.connection.poll_for_event()? {
+                if !self.handle_event(&event)? {
+                    return Ok(());
+                }
+
+                if self.shell.should_close() {
+                    return Ok(());
+                }
+            }
+
+            if self.shell.take_redraw_request() {
+                for index in 0..self.windows.len() {
+                    self.redraw(index)?;
+                }
+            }
+
+            // A modest timer keeps animated or time-based surfaces current
+            // without making the backend depend on a widget implementation.
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn redraw(&mut self, index: usize) -> Result<(), Box<dyn Error>> {
+        let window = &self.windows[index];
+        let pixels = self.shell.render(window.surface, window.size, None)?;
+        let expected = window.size.width as usize * window.size.height as usize * 4;
+
+        if pixels.len() != expected {
+            return Err(format!(
+                "surface {:?} rendered {} bytes, expected {expected}",
+                window.surface,
+                pixels.len()
+            )
+            .into());
+        }
+
+        self.connection.put_image(
+            ImageFormat::Z_PIXMAP,
+            window.window,
+            window.gc,
+            u16::try_from(window.size.width)?,
+            u16::try_from(window.size.height)?,
+            0,
+            0,
+            0,
+            24,
+            &pixels,
+        )?;
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn window_index(&self, window: u32) -> Option<usize> {
+        self.windows.iter().position(|state| state.window == window)
+    }
+
+    fn handle_event(&mut self, event: &x11rb::protocol::Event) -> Result<bool, Box<dyn Error>> {
+        use x11rb::protocol::Event;
+
+        match event {
+            Event::Expose(event) => {
+                if let Some(index) = self.window_index(event.window) {
+                    self.redraw(index)?;
+                }
+            }
+            Event::ConfigureNotify(event) => {
+                if let Some(index) = self.window_index(event.window) {
+                    let size = Size::new(
+                        u32::from(event.width).max(1),
+                        u32::from(event.height).max(1),
+                    );
+                    self.windows[index].size = size;
+                    let surface = self.windows[index].surface;
+
+                    self.shell
+                        .handle_event(surface, InputEvent::Resized { size });
+                    self.redraw(index)?;
+                }
+            }
+            Event::EnterNotify(event) => {
+                self.pointer_event(
+                    event.event,
+                    InputEvent::PointerEnter {
+                        position: PositionF64::new(
+                            f64::from(event.event_x),
+                            f64::from(event.event_y),
+                        ),
+                        output: None,
+                    },
+                );
+            }
+            Event::LeaveNotify(event) => {
+                self.pointer_event(event.event, InputEvent::PointerLeave);
+            }
+            Event::MotionNotify(event) => {
+                self.pointer_event(
+                    event.event,
+                    InputEvent::PointerMotion {
+                        position: PositionF64::new(
+                            f64::from(event.event_x),
+                            f64::from(event.event_y),
+                        ),
+                        output: None,
+                    },
+                );
+            }
+            Event::ButtonPress(event) => self.button_press(event)?,
+            Event::ButtonRelease(event) if event.detail <= 3 => {
+                self.pointer_event_with_position(
+                    event.event,
+                    PositionF64::new(f64::from(event.event_x), f64::from(event.event_y)),
+                    InputEvent::PointerButton {
+                        position: PositionF64::new(
+                            f64::from(event.event_x),
+                            f64::from(event.event_y),
+                        ),
+                        button: mouse_button(event.detail),
+                        pressed: false,
+                        output: None,
+                    },
+                );
+            }
+            Event::KeyPress(event) => self.key_event(event.event, event.detail, event.state, true),
+            Event::KeyRelease(event) => {
+                self.key_event(event.event, event.detail, event.state, false);
+            }
+            Event::FocusOut(event) => {
+                if let Some(index) = self.window_index(event.event) {
+                    self.shell
+                        .handle_event(self.windows[index].surface, InputEvent::FocusLost);
+                }
+            }
+            Event::MappingNotify(_) => {
+                self.keyboard_mapping = keyboard_mapping(&self.connection)?;
+            }
+            Event::ClientMessage(ClientMessageEvent { window, data, .. })
+                if data.as_data32()[0] == self.atoms.wm_delete_window =>
+            {
+                if let Some(index) = self.window_index(*window) {
+                    self.shell
+                        .handle_event(self.windows[index].surface, InputEvent::CloseRequested);
+                }
+
+                return Ok(false);
+            }
+            _ => {}
+        }
+
+        Ok(true)
+    }
+
+    fn button_press(
+        &mut self,
+        event: &x11rb::protocol::xproto::ButtonPressEvent,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(index) = self.window_index(event.event) {
+            let position = PositionF64::new(f64::from(event.event_x), f64::from(event.event_y));
+
+            let input = match event.detail {
+                4 => Some(InputEvent::PointerScroll {
+                    position,
+                    delta_x: 0.0,
+                    delta_y: -1.0,
+                    output: None,
+                }),
+                5 => Some(InputEvent::PointerScroll {
+                    position,
+                    delta_x: 0.0,
+                    delta_y: 1.0,
+                    output: None,
+                }),
+                6 => Some(InputEvent::PointerScroll {
+                    position,
+                    delta_x: 1.0,
+                    delta_y: 0.0,
+                    output: None,
+                }),
+                7 => Some(InputEvent::PointerScroll {
+                    position,
+                    delta_x: -1.0,
+                    delta_y: 0.0,
+                    output: None,
+                }),
+                button => Some(InputEvent::PointerButton {
+                    position,
+                    button: mouse_button(button),
+
+                    pressed: true,
+                    output: None,
+                }),
+            };
+
+            self.shell
+                .handle_event(self.windows[index].surface, input.unwrap());
+            self.redraw(index)?;
+        }
+
+        Ok(())
+    }
+
+    fn pointer_event(&mut self, window: u32, event: InputEvent) {
+        if let Some(index) = self.window_index(window) {
+            self.shell.handle_event(self.windows[index].surface, event);
+        }
+    }
+
+    fn pointer_event_with_position(
+        &mut self,
+        window: u32,
+        _position: PositionF64,
+        event: InputEvent,
+    ) {
+        self.pointer_event(window, event);
+    }
+
+    fn key_event(&mut self, window: u32, keycode: u8, modifiers: KeyButMask, pressed: bool) {
+        if let Some(index) = self.window_index(window) {
+            self.shell.handle_event(
+                self.windows[index].surface,
+                InputEvent::Key {
+                    keycode: u32::from(keycode),
+                    pressed,
+                },
+            );
+
+            if pressed {
+                let offset = usize::from(keycode.saturating_sub(self.min_keycode))
+                    * usize::from(self.keyboard_mapping.keysyms_per_keycode);
+                let per_keycode = usize::from(self.keyboard_mapping.keysyms_per_keycode);
+
+                let alphabetic = self
+                    .keyboard_mapping
+                    .keysyms
+                    .get(offset)
+                    .is_some_and(|symbol| {
+                        (*symbol >= u32::from(b'A') && *symbol <= u32::from(b'Z'))
+                            || (*symbol >= u32::from(b'a') && *symbol <= u32::from(b'z'))
+                    });
+                let shifted = modifiers.contains(KeyButMask::SHIFT)
+                    ^ (alphabetic && modifiers.contains(KeyButMask::LOCK));
+                let altgr = modifiers.contains(KeyButMask::MOD5) && per_keycode >= 4;
+                let column = (usize::from(altgr) * 2 + usize::from(shifted))
+                    .min(per_keycode.saturating_sub(1));
+
+                let symbol = self
+                    .keyboard_mapping
+                    .keysyms
+                    .get(offset + column)
+                    .copied()
+                    .unwrap_or(0);
+
+                let key = match symbol {
+                    0xff1b => Key::Escape,
+                    0xff0d | 0xff8d => Key::Return,
+                    0xff08 => Key::Backspace,
+                    0xff52 => Key::Up,
+                    0xff54 => Key::Down,
+                    _ => Key::Other,
+                };
+
+                let text = if modifiers.intersects(KeyButMask::CONTROL | KeyButMask::MOD1) {
+                    None
+                } else {
+                    let codepoint = match symbol {
+                        0x20..=0x7e | 0xa0..=0xff => Some(symbol),
+                        _ if symbol & 0xff00_0000 == 0x0100_0000 => Some(symbol & 0x00ff_ffff),
+                        _ => None,
+                    };
+
+                    codepoint
+                        .and_then(char::from_u32)
+                        .filter(|c| !c.is_control())
+                        .map(|c| c.to_string())
+                };
+
+                self.shell.handle_event(
+                    self.windows[index].surface,
+                    InputEvent::KeyInput { key, text },
+                );
+            }
+        }
+    }
+}
+
+fn keyboard_mapping(
+    connection: &RustConnection,
+) -> Result<x11rb::protocol::xproto::GetKeyboardMappingReply, Box<dyn Error>> {
+    let setup = connection.setup();
+    Ok(connection
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
+        .reply()?)
+}
+
+fn mouse_button(button: u8) -> MouseButton {
+    match button {
+        1 => MouseButton::Left,
+        2 => MouseButton::Middle,
+        3 => MouseButton::Right,
+        other => MouseButton::Other(u32::from(other)),
+    }
+}
+
+fn set_strut(
+    connection: &RustConnection,
+    window: u32,
+    atoms: Atoms,
+    screen: &x11rb::protocol::xproto::Screen,
+    config: &SurfaceConfig,
+) -> Result<(), Box<dyn Error>> {
+    let zone = u32::try_from(config.exclusive_zone.max(0)).unwrap_or(0);
+
+    if zone == 0 {
+        return Ok(());
+    }
+
+    let width = u32::from(screen.width_in_pixels);
+    let height = u32::from(screen.height_in_pixels);
+
+    let top = if config.anchors.contains(super::Anchors::TOP) {
+        zone
+    } else {
+        0
+    };
+
+    let bottom = if config.anchors.contains(super::Anchors::BOTTOM) {
+        zone
+    } else {
+        0
+    };
+
+    let left = if config.anchors.contains(super::Anchors::LEFT) {
+        zone
+    } else {
+        0
+    };
+
+    let right = if config.anchors.contains(super::Anchors::RIGHT) {
+        zone
+    } else {
+        0
+    };
+
+    connection.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_strut,
+        AtomEnum::CARDINAL,
+        &[left, right, top, bottom],
+    )?;
+
+    let partial_strut = [
+        left,
+        right,
+        top,
+        bottom,
+        0,
+        height.saturating_sub(1),
+        0,
+        height.saturating_sub(1),
+        0,
+        width.saturating_sub(1),
+        0,
+        width.saturating_sub(1),
+    ];
+
+    connection.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_strut_partial,
+        AtomEnum::CARDINAL,
+        &partial_strut,
+    )?;
+    Ok(())
+}
+
+x11rb::atom_manager! {
+    Atoms: AtomsCookie {
+        net_wm_window_type: b"_NET_WM_WINDOW_TYPE".as_slice(),
+        net_wm_window_type_dock: b"_NET_WM_WINDOW_TYPE_DOCK".as_slice(),
+        net_wm_window_type_normal: b"_NET_WM_WINDOW_TYPE_NORMAL".as_slice(),
+        net_wm_state: b"_NET_WM_STATE".as_slice(),
+        net_wm_state_above: b"_NET_WM_STATE_ABOVE".as_slice(),
+        net_wm_strut: b"_NET_WM_STRUT".as_slice(),
+        net_wm_strut_partial: b"_NET_WM_STRUT_PARTIAL".as_slice(),
+        net_wm_name: b"_NET_WM_NAME".as_slice(),
+        utf8_string: b"UTF8_STRING".as_slice(),
+        wm_protocols: b"WM_PROTOCOLS".as_slice(),
+        wm_delete_window: b"WM_DELETE_WINDOW".as_slice(),
+    }
+}
