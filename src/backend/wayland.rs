@@ -1,11 +1,15 @@
 use std::{
     error::Error,
-    os::fd::{AsFd, AsRawFd},
+    os::fd::AsFd,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use memmap2::MmapMut;
+use nix::{
+    errno::Errno,
+    poll::{PollFd, PollFlags, poll},
+};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
@@ -119,28 +123,23 @@ fn run(shell: &mut dyn Shell) -> Result<(), Box<dyn Error>> {
         connection.flush()?;
 
         if let Some(guard) = event_queue.prepare_read() {
-            let mut fd = libc::pollfd {
-                fd: connection.backend().poll_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            let backend = connection.backend();
+            let mut fds = [PollFd::new(backend.poll_fd(), PollFlags::POLLIN)];
+
             // A bounded wait lets external controllers close a visible surface.
             let timeout = state
                 .repeating_key
                 .as_ref()
                 .map(|repeat| repeat.next.saturating_duration_since(Instant::now()))
-                .map_or(50, |remaining| remaining.as_millis().clamp(1, 50) as i32);
+                .map_or(50, |remaining| remaining.as_millis().clamp(1, 50) as u16);
 
-            // SAFETY: fd points to one initialized pollfd for a live connection.
-            let ready = unsafe { libc::poll(&raw mut fd, 1, timeout) };
-
-            if ready > 0 {
-                guard.read()?;
-                event_queue.dispatch_pending(&mut state)?;
-            } else if ready < 0
-                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                return Err(std::io::Error::last_os_error().into());
+            match poll(&mut fds, timeout) {
+                Ok(0) | Err(Errno::EINTR) => {}
+                Ok(_) => {
+                    guard.read()?;
+                    event_queue.dispatch_pending(&mut state)?;
+                }
+                Err(error) => return Err(error.into()),
             }
         }
 
