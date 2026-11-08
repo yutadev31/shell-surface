@@ -1,18 +1,21 @@
 {
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    blueprint = {
-      url = "github:numtide/blueprint";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-  };
+  inputs.rustdev-nix.url = "github:yutadev31/rustdev-nix";
 
   outputs =
     inputs:
-    inputs.blueprint {
+    inputs.rustdev-nix.lib.mkFlake {
       inherit inputs;
-      prefix = "nix/";
+      src = ./.;
+
+      packageAttrs = { pkgs, ... }: {
+        nativeBuildInputs = [
+          pkgs.pkg-config
+        ];
+
+        buildInputs = [
+          pkgs.libxkbcommon
+          pkgs.wayland
+        ];
+      };
     };
 }
