@@ -2,6 +2,7 @@
 name = "shell-surface"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/yutadev31/shell-surface.git"
 license = "MIT"
 
 [dependencies]
