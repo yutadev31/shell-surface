@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 memmap2 = { version = "0.9.12", optional = true }
-nix = { version = "0.31.3", features = ["poll"], optional = true }
+nix = { version = "0.32.0", features = ["poll"], optional = true }
 tempfile = { version = "3.27.0", optional = true }
 thiserror = "2.0.21"
 wayland-client = { version = "0.31.15", optional = true }
